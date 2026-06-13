@@ -242,4 +242,4 @@ improvements back. If you reuse it, the same openness applies — any derivative
 must also be open-sourced under the AGPL. This is the published security layer
 of WispDay; the rest of the app is separate.
 
-Found a security issue? See **[Reporting a security issue](#reporting-a-security-issue)** above.
+Found a security issue? See **[Contributing & security reports](#reporting-a-security-issue)** above.
