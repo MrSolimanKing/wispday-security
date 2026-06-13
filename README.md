@@ -230,7 +230,8 @@ reproduce it helps. Reports are read and taken seriously.
 
 WispDay does not currently run a paid bug-bounty program. We can't offer
 compensation for reports right now, and we're grateful for good-faith
-disclosures regardless. If that changes, we'll say so here. 
+disclosures regardless. If that changes, we'll say so here.
+
 ---
 
 ## License & usage
@@ -242,4 +243,4 @@ improvements back. If you reuse it, the same openness applies — any derivative
 must also be open-sourced under the AGPL. This is the published security layer
 of WispDay; the rest of the app is separate.
 
-Found a security issue? See **[Contributing & security reports](#reporting-a-security-issue)** above.
+Found a security issue? See [Contributing & security reports](#contributing--security-reports) above. 
