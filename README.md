@@ -217,17 +217,20 @@ out of scope here.
 
 ---
 
-## Reporting a security issue
+## Contributing & security reports
 
-We want to hear about security problems, and we welcome good-faith research.
+**Improvements, fixes, and questions** — open an issue or a pull request.
+Contributions that make WispDay safer or clearer are genuinely welcome, and
+discussing the code in the open is encouraged.
 
-> **Security contact:** _[contact@wispday.com]_
+**Found an actual security vulnerability?** Those, please report privately to
+**[contact@wispday.com](mailto:contact@wispday.com)** instead of opening a
+public issue, so it can be fixed before it's disclosed. Enough detail to
+reproduce it helps. Reports are read and taken seriously.
 
-If you believe you've found a vulnerability, please report it privately to the
-address above rather than opening a public issue, so it can be addressed before
-disclosure. Including enough detail to reproduce it helps a lot. Reports are
-read and taken seriously.
-
+WispDay does not currently run a paid bug-bounty program. We can't offer
+compensation for reports right now, and we're grateful for good-faith
+disclosures regardless. If that changes, we'll say so here. 
 ---
 
 ## License & usage
