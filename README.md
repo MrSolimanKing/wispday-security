@@ -221,7 +221,7 @@ out of scope here.
 
 We want to hear about security problems, and we welcome good-faith research.
 
-> **Security contact:** _[add your contact here — e.g. security@wispday.com]_
+> **Security contact:** _[contact@wispday.com]_
 
 If you believe you've found a vulnerability, please report it privately to the
 address above rather than opening a public issue, so it can be addressed before
@@ -232,12 +232,11 @@ read and taken seriously.
 
 ## License & usage
 
-This code is published **for security review and verification only**.
+© 2026 WispDay. Licensed under the [GNU AGPLv3](https://www.gnu.org/licenses/agpl-3.0.html).
 
-All rights reserved. It is **not** licensed for reuse, modification, or
-redistribution, in whole or in part, in any other project. You are welcome to
-read, analyze, and discuss it for the purpose of evaluating WispDay's security.
-For any other use, please get in touch.
+You're welcome to read, verify, and learn from this code, and to contribute
+improvements back. If you reuse it, the same openness applies — any derivative
+must also be open-sourced under the AGPL. This is the published security layer
+of WispDay; the rest of the app is separate.
 
-_(This is a plain-language usage statement, not a vetted open-source license. It
-reflects the intent that the code be open to inspection but closed to reuse.)_
+Found a security issue? See **[Reporting a security issue](#reporting-a-security-issue)** above.
