@@ -186,17 +186,6 @@ These are deliberate decisions, stated openly rather than hidden:
   `react-native-background-timer`, which is not actively maintained. It is on a
   security-relevant path.
 
-**Out of scope / not claimed**
-
-- This is not a defense against a fully compromised OS or an attacker with the user's unlocked device and recovery phrase (12 word).
-- AI / processing features (if any entry text is sent for processing) are a
-  separate, disclosed feature and are **not** part of the at-rest encryption
-  pipeline shown here.
-- The server implementation is not in this repository (see below).
-- The native image-decryption module (Objective-C / Swift) is not yet published;
-  only its JS bridge is here. That native component is where decrypted pixels
-  briefly exist, and is the natural next thing to publish for full verification.
-
 ---
 
 ## The server boundary
