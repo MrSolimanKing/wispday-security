@@ -1,5 +1,9 @@
 # WispDay — Security Layer
 
+
+[![Download on the App Store](https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg)](https://apps.apple.com/us/app/wispday-private-daily-diary/id6765516524)
+
+
 This repository contains the client-side security layer of **WispDay**, an
 end-to-end encrypted journal app. It is published so the app's encryption
 claims can be independently inspected.
