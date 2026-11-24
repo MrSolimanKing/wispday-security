@@ -1,71 +1,27 @@
-/**
- * WispDay — SecurityLockScreen
- * =====================================================================
- * This is the gate that enforces the lock established by the lifecycle
- * hook (useAppLockLifecycle). When the master key has been wiped from RAM
- * (on background, or at cold boot before unlock), the app shows this
- * screen and the user cannot reach any decrypted content until a
- * successful unlock restores the key.
- *
- * What a reviewer can verify here:
- *
- *   - UNLOCK is gated on the encryption engine. attemptUnlock() calls
- *     encryptionService.tryUnlock(); only a 'success' result calls
- *     onUnlockSuccess() (which reopens the databases). No other path
- *     reveals content.
- *
- *   - A PASSIVE hardware/enrollment check runs before any biometric
- *     prompt, so the screen does not fire prompts when biometrics are
- *     unavailable or disabled, and it distinguishes "temporarily locked
- *     out" from "key invalidated by a biometric enrollment change".
- *
- *   - The INVALIDATED path is fail-safe, not auto-destructive. When the OS
- *     reports the protected key was invalidated (e.g. the user added or
- *     removed a fingerprint/face), the screen does NOT silently wipe. It
- *     surfaces a distinct state and requires an explicit user action,
- *     which then clears the invalidated biometric binding, rotates the
- *     database files, and ends the session via softLogout. The user's
- *     data is only unwound on their explicit confirmation.
- *
- * The key operations live in EncryptionService.ts. App wiring passed in as
- * props or imported (session teardown, DB rotation, i18n, theming) is
- * marked `// [app boundary]`; those modules are not part of this repo.
- */
-
+// SecurityLockScreen.tsx
 import React, { useEffect, useState, useRef } from 'react';
 import { View, Text, TouchableOpacity, ActivityIndicator, AppState, AppStateStatus, Linking } from 'react-native';
-import BootSplash from 'react-native-bootsplash';
+import BootSplash from "react-native-bootsplash";
 import * as LocalAuthentication from 'expo-local-authentication';
-import { useTranslation } from 'react-i18next';
 import { encryptionService } from '../../middleware/EncryptionMiddleware';
-
-// [app boundary] — rotates (re-keys / recreates) the encrypted database files
-// as part of the invalidated-key recovery. Implementation omitted; the
-// security-relevant fact is that recovery rotates the DBs before re-use.
-declare function rotateDatabaseFiles(): Promise<void>;
-
-// [app boundary] — encrypted KV store; here only the biometric/security flags
-// are touched during invalidated-key recovery.
-declare const appStorage: {
-  set: (key: string, value: boolean) => void;
-};
+import { rotateDatabaseFiles } from '../../database/AppDatabase';
+import { appStorage } from '../../storage/AppStorage';
+import { useTranslation } from 'react-i18next'; // Added translation import
 
 export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecureLogout }: any) {
-  const { t } = useTranslation();
+  const { t } = useTranslation(); // Added useTranslation Hook
   const [checking, setChecking] = useState(false);
-  const [outcome, setOutcome] = useState<'none' | 'locked_out' | 'invalidated' | 'failed' | 'permission_disabled'>('none');
+  const [outcome, setOutcome]   = useState<'none' | 'locked_out' | 'invalidated' | 'failed' | 'permission_disabled'>('none');
 
   const isMounted     = useRef(true);
   const attemptingRef = useRef(false);
   const outcomeRef    = useRef<'none' | 'locked_out' | 'invalidated' | 'failed' | 'permission_disabled'>('none');
 
-  // Track whether the app actually hit the background (vs. a spurious
-  // active→active transition), to avoid re-prompting on every state change.
+  // 🛡️ Track if the app ACTUALLY hit the background
   const hasHitBackground = useRef(false);
   const lastAutoRetry = useRef(0);
 
-  // Passive guard: checks hardware + enrollment WITHOUT triggering a prompt,
-  // so we never fire a biometric alert when it would just fail.
+  // 🛡️ PASSIVE SECURITY GUARD: Checks hardware and permission status without triggering a prompt
   const checkBiometricAvailability = async (): Promise<boolean> => {
     try {
       const hasHardware = await LocalAuthentication.hasHardwareAsync();
@@ -88,7 +44,7 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
     attemptingRef.current = true;
     setChecking(true);
 
-    // Passive validation first so we don't fire a prompt if biometrics are blocked.
+    // Run passive validation first to ensure we don't fire an alert if blocked
     const available = await checkBiometricAvailability();
     if (!available) {
       attemptingRef.current = false;
@@ -96,21 +52,33 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
       return;
     }
 
-    // Re-arm the single-prompt coordinator for exactly one user-initiated
-    // unlock, and shield the lifecycle hook from treating the biometric
-    // prompt's brief backgrounding as a lock trigger.
     encryptionService.armUnlockAttempt();
     encryptionService.isIntentionalBackground = true;
 
     try {
-      const result = await encryptionService.tryUnlock();
+      let result: Awaited<ReturnType<typeof encryptionService.tryUnlock>>;
+      try {
+        result = await encryptionService.tryUnlock();
+      } finally {
+        // Face ID is done: from here on a trip to the background is a real one again (it used to
+        // stay "intentional" until the whole unlock had finished – leaving the app then skipped
+        // the lock and the next return showed no Face ID).
+        setTimeout(() => { encryptionService.isIntentionalBackground = false; }, 1500);
+      }
       if (!isMounted.current) return;
 
       if (result === 'success') {
         outcomeRef.current = 'none';
         setOutcome('none');
         BootSplash.hide({ fade: true });
-        await onUnlockSuccess();   // [app boundary] reopens encrypted databases
+        // Never wait forever: if reopening hangs, the button comes back (and the next return
+        // asks for Face ID again) instead of a spinner that blocks every later attempt.
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        await Promise.race([
+          Promise.resolve(onUnlockSuccess()),
+          new Promise<void>((r) => { timer = setTimeout(r, 15000); }),
+        ]);
+        if (timer) clearTimeout(timer);
         return;
       }
       outcomeRef.current = result;
@@ -122,8 +90,6 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
         setOutcome('failed');
       }
     } finally {
-      // Release the intentional-background shield shortly after the prompt.
-      setTimeout(() => { encryptionService.isIntentionalBackground = false; }, 1500);
       attemptingRef.current = false;
       if (isMounted.current) setChecking(false);
     }
@@ -132,7 +98,7 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
   useEffect(() => {
     isMounted.current = true;
 
-    // Initial boot validation + unlock attempt.
+    // 1. Initial boot validation and check
     const initBoot = async () => {
       const available = await checkBiometricAvailability();
       if (available && AppState.currentState === 'active') {
@@ -146,15 +112,16 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
     }
 
     const subscription = AppState.addEventListener('change', async (nextAppState: AppStateStatus) => {
+      // 2. Mark when the app genuinely leaves the screen
       if (nextAppState === 'background') {
         hasHitBackground.current = true;
       }
 
       if (nextAppState === 'active') {
         const cameFromBg = hasHitBackground.current;
-        hasHitBackground.current = false;
+        hasHitBackground.current = false; // Reset for next time
 
-        // Returning from system Settings: re-check whether permission was re-enabled.
+        // If coming back from system Settings, verify if they re-enabled permission
         if (outcomeRef.current === 'permission_disabled') {
           const nowAvailable = await checkBiometricAvailability();
           if (nowAvailable) {
@@ -163,13 +130,11 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
           return;
         }
 
-        // Loop breaker: only auto-retry on a genuine background→active return,
-        // never while a prompt is in flight, already unlocked, or too soon
-        // after the last attempt.
+        // 🛡️ CRITICAL LOOP BREAKER:
         if (!cameFromBg) return;
         if (encryptionService.isIntentionalBackground) return;
         if (attemptingRef.current) return;
-        if (outcomeRef.current === 'none' && encryptionService.ready) return;
+        // (Keys already in memory → attemptUnlock finishes without a Face ID prompt.)
 
         if (Date.now() - lastAutoRetry.current < 2000) return;
         lastAutoRetry.current = Date.now();
@@ -184,12 +149,13 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
       encryptionService.isIntentionalBackground = false;
     };
   }, []);
+  
 
   const accent = theme.colors.notification ?? '#e53935';
 
   let message: string | null = null;
   let buttonLabel = t('texts:SECURITY_LOCK_SCREEN:UNLOCK_BTN');
-  let onPressAction = attemptUnlock;
+  let onPressAction = attemptUnlock; 
 
   if (outcome === 'permission_disabled') {
     message = t('texts:SECURITY_LOCK_SCREEN:MSG_PERMISSION_DISABLED');
@@ -202,25 +168,24 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
     buttonLabel = t('texts:SECURITY_LOCK_SCREEN:TRY_AGAIN_BTN');
   } else if (outcome === 'invalidated') {
     message = t('texts:SECURITY_LOCK_SCREEN:MSG_INVALIDATED');
-    buttonLabel = t('texts:SECURITY_LOCK_SCREEN:SECURE_LOGOUT_BTN');
-
-    // Invalidated key recovery — runs ONLY on explicit user confirmation.
+    buttonLabel = t('texts:SECURITY_LOCK_SCREEN:SECURE_LOGOUT_BTN'); 
+     
     onPressAction = async () => {
       setChecking(true);
-      try {
-        // Clear the invalidated biometric binding and disable the biometric tiers.
+      try {  
         encryptionService.forceClearInvalidatedBiometrics();
-        appStorage.set('vault_key_binding_enabled', false);  // [app boundary]
-        appStorage.set('max_security_enabled', false);       // [app boundary]
-
-        await rotateDatabaseFiles();                         // [app boundary]
-
+        appStorage.set('vault_key_binding_enabled', false);
+        appStorage.set('max_security_enabled', false);
+ 
+        await rotateDatabaseFiles();
+        
         if (softLogout) {
-          await softLogout();                                // [app boundary] ends session
+          await softLogout();
         }
+
         if (onSecureLogout) {
-          onSecureLogout();                                  // [app boundary]
-        }
+          onSecureLogout();
+        } 
       } catch (e) {
         console.error('Failed to wipe session', e);
         setChecking(false);
@@ -244,7 +209,7 @@ export function SecurityLockScreen({ theme, onUnlockSuccess, softLogout, onSecur
         </Text>
       )}
 
-      {checking ? (
+      {checking ? ( 
         <ActivityIndicator size="large" color={theme.colors.primary} />
       ) : (
         <TouchableOpacity

@@ -1,5 +1,5 @@
 /**
- * WispDay — ItemEncryptionFlow (excerpt)
+ * WispDay — ItemsContext (excerpt)
  * =====================================================================
  * This is a TRIMMED excerpt of the app's diary-entry data layer,
  * published so the points where entry data is encrypted and decrypted
@@ -12,7 +12,7 @@
  * App subsystems are reduced to their call shape and marked
  * `// [app boundary]`. They show WHAT crosses the boundary (e.g. "the row
  * written to the database holds ciphertext"), not how those subsystems
- * work. The encryption primitives live in EncryptionService.ts; this file
+ * work. The encryption primitives live in EncryptionMiddleware.ts; this file
  * only shows WHEN they are applied to entry data.
  *
  * The three guarantees this excerpt lets you verify:
@@ -20,8 +20,8 @@
  *   1. WRITE: entry text is encrypted before it is persisted.
  *      Before an entry row is inserted into the local database, its
  *      sensitive text fields (content, notes, categories) are passed
- *      through encryptionService.encrypt(). The plaintext is never written
- *      to the items table. Non-sensitive metadata (timestamps, mood
+ *      through encryptionService.encrypt(), so with a key loaded the items
+ *      table holds the iv:tag:ciphertext bundle. Non-sensitive metadata (timestamps, mood
  *      numbers, flags) is stored in clear so the app can sort/filter
  *      without a key — none of it is diary content.
  *
@@ -33,10 +33,13 @@
  *      partial plaintext.
  *
  *   3. MEDIA: files are encrypted on disk before they are queued to upload.
- *      A picked photo/video/voice file is encrypted via
+ *      Photos and voice memos are encrypted via
  *      encryptionService.encryptFile() — which writes a .enc file and
  *      returns the IV, auth tag and the per-file DEK wrapped under the
- *      master key. ONLY the encrypted file and those wrapping fields are
+ *      master key. Videos and PDFs use a chunked AES-GCM container encrypted
+ *      natively (see secure-media/videoEncryption.ts and
+ *      documentEncryption.ts): the same kind of per-file DEK, wrapped the same
+ *      way, with the IVs and tags stored inside the file. ONLY the encrypted file and those wrapping fields are
  *      queued for upload. The raw plaintext file is never uploaded; the
  *      server only ever receives ciphertext plus a wrapped DEK it cannot
  *      unwrap (it has no master key).
@@ -111,18 +114,18 @@ interface EncryptedUploadEntry {
  * sorting/filtering is intentionally left in clear (it is not entry content).
  */
 export async function addItem(item: PlainItemInput): Promise<void> {
-  // Encrypt every sensitive text field. If encrypt() returns null (no key),
-  // the app falls back to NOT persisting plaintext — here we simply require a
-  // key by throwing, to make the invariant explicit for review.
-  const encryptedContent = encryptionService.encrypt(item.content);
-  if (encryptedContent === null) throw new Error('No key — refusing to write plaintext.');
+  // Sensitive text fields go through encrypt() before the row is persisted.
+  // These are the app's actual expressions: encrypt() returns the
+  // `iv:tag:ciphertext` bundle, and the field falls back to its input if
+  // encrypt() returns null.
+  const encryptedContent = encryptionService.encrypt(item.content) || item.content;
 
   const encryptedNotes = item.notes
-    ? encryptionService.encrypt(item.notes)
+    ? encryptionService.encrypt(item.notes) || item.notes
     : null;
 
   const encryptedCategories = item.categories && item.categories.length > 0
-    ? encryptionService.encrypt(JSON.stringify(item.categories))
+    ? encryptionService.encrypt(JSON.stringify(item.categories)) || JSON.stringify(item.categories)
     : null;
 
   // The row written to the database: ciphertext in the text columns, plain

@@ -1,84 +1,41 @@
-/**
- * WispDay — EncryptedImage (native bridge)
- * =====================================================================
- * This is the JavaScript side of encrypted-image rendering. It does NOT
- * decrypt anything itself — it resolves the correct decryption key and
- * hands it, with the file's IV and auth tag, to a native view
- * (`WispdayEncryptedImageView`) that performs the AES-128-GCM decrypt in
- * memory, decodes/downsamples the bitmap, and displays it via ImageIO.
- * No plaintext image is ever written back to disk, and large decoded
- * bitmaps never cross the JS bridge.
- *
- * Why this file is worth reviewing:
- *
- *   - It shows the KEY HANDOFF to native. For per-file (envelope)
- *     encryption, the per-file DEK is unwrapped here in JS using the
- *     audited encryptionService.unwrapDEK() and only that single-file DEK
- *     is passed to native. The native component therefore never receives
- *     or stores the user's master key — at most it sees one file's DEK for
- *     the lifetime of one render. (The `decryptionKeyBase64` prop name is
- *     generic; in the envelope path its value is the unwrapped DEK, not
- *     the master key.)
- *
- *   - It FAILS CLOSED. If no key is available (locked / logged out) or the
- *     IV/tag are missing, the component renders nothing rather than
- *     attempting to display anything.
- *
- *   - It re-resolves the key on key-change events, so when the app locks
- *     (master key wiped from RAM via lockMemory) the next render has no
- *     key and shows nothing until unlock.
- *
- * The cryptographic operations (unwrapDEK, key storage, the GCM scheme)
- * live in EncryptionService.ts. The native decryptor mirrors that same
- * AES-128-GCM contract; its source is published separately.
- */
-
 import { requireNativeComponent, StyleSheet, ViewStyle } from 'react-native';
 import { memo, useEffect, useState, useCallback } from 'react';
 import { encryptionService } from '../middleware/EncryptionMiddleware';
+import { isWdc2 } from '../secure-media/mediaFormat';
+import { EncryptedVideoFrame } from '../secure-media/EncryptedVideoFrame';
+import { EncryptedPdfThumbnail } from '../secure-media/EncryptedPdf';
+import { mediaCacheManager } from '../utils/MediaCacheManager';
 
 interface NativeEncryptedImageProps {
   encryptedFilePath: string;
-  decryptionKeyBase64: string;   // per-file DEK (envelope) or master key (legacy)
+  decryptionKeyBase64: string; 
   ivBase64: string;
   tagBase64: string;
   resizeMode?: 'cover' | 'contain';
   style?: ViewStyle;
-  onLoad?: (event: any) => void;
+  onLoad?: (event: any) => void; 
 }
+ 
+const NativeEncryptedImageView = requireNativeComponent<NativeEncryptedImageProps>('WispdayEncryptedImageView');
 
-const NativeEncryptedImageView =
-  requireNativeComponent<NativeEncryptedImageProps>('WispdayEncryptedImageView');
-
-// The native side expects base64 inputs; the IV/tag are stored as hex.
 function hexToBase64(hex: string): string {
-  const bytes: number[] = [];
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes.push(parseInt(hex.substr(i, 2), 16));
-  }
-  return btoa(String.fromCharCode(...bytes));
+    const bytes = [];
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes.push(parseInt(hex.substr(i, 2), 16));
+    }
+    return btoa(String.fromCharCode(...bytes));
 }
 
-export const EncryptedImage = memo(({
-  img,
-  style,
-  resizeMode = 'cover',
-  onLoad,
-}: {
-  img: any;
-  style?: any;
-  resizeMode?: 'cover' | 'contain';
-  onLoad?: () => void;
-}) => {
+export const EncryptedImage = memo(({ img, style, resizeMode = 'cover', onLoad }: { img: any, style?: any, resizeMode?: 'cover' | 'contain', onLoad?: () => void; }) => {
   const rawUri = img?.thumbnail || img?.uri || null;
-
+  
   const [decryptionKeyBase64, setDecryptionKeyBase64] = useState<string | null>(null);
 
-  // Resolve the key to hand to native:
-  //   - Envelope path: unwrap the per-file DEK with the master key (in JS,
-  //     via the audited unwrapDEK) and pass ONLY that DEK to native.
-  //   - Legacy path (no wrapped DEK on the item): pass the active key.
-  // If no key is available, pass null → the component renders nothing.
+  // Not on the phone yet (still downloading): this one is on screen, so it goes first.
+  useEffect(() => {
+    if (!rawUri && img?.id) mediaCacheManager.prioritize(img.id);
+  }, [rawUri, img?.id]);
+
   const resolveKey = useCallback(() => {
     const masterOrGuestKey = encryptionService.getRawKeyBase64();
     if (!masterOrGuestKey) {
@@ -95,31 +52,59 @@ export const EncryptedImage = memo(({
   }, [img?.encryptedDek, img?.dekIv, img?.dekTag]);
 
   useEffect(() => {
-    // Resolve on mount, and re-resolve whenever key state changes (e.g. the
-    // app locks and wipes the master key, or unlocks and restores it).
+    // 1. Resolve immediately on mount
     resolveKey();
-    const unsubscribe = encryptionService.onKeyChange(resolveKey);
+
+    // 2. Listen to the central middleware for key changes
+    const unsubscribe = encryptionService.onKeyChange(() => {
+      resolveKey();
+    });
+
     return () => unsubscribe();
   }, [resolveKey]);
 
-  // Fail closed: without a file, a resolved key, and the IV+tag, render nothing.
-  if (!rawUri || !decryptionKeyBase64 || !img?.encryptionIv || !img?.encryptionTag) {
-    return null;
+  // WDC2 PDFs: first page, decrypted in RAM only.
+  if (isWdc2(img) && img?.type === 'document') {
+    return (
+      <EncryptedPdfThumbnail
+        media={img}
+        style={style ?? [StyleSheet.absoluteFill, { borderRadius: 16 }]}
+        resizeMode={resizeMode === 'contain' ? 'contain' : 'cover'}
+        onLoad={onLoad ? () => onLoad() : undefined}
+      />
+    );
   }
 
-  const filePath  = rawUri.replace('file://', '');
+  // WDC2 (chunked) videos: show the decrypted first frame, kept in RAM only.
+  if (isWdc2(img)) {
+    return (
+      <EncryptedVideoFrame
+        media={img}
+        style={style ?? [StyleSheet.absoluteFill, { borderRadius: 16 }]}
+        resizeMode={resizeMode}
+        onLoad={onLoad ? () => onLoad() : undefined}
+      />
+    );
+  }
+
+  if (!rawUri || !decryptionKeyBase64 || !img?.encryptionIv || !img?.encryptionTag) {
+    return null;
+  }   
+
+  const filePath = rawUri.replace('file://', '');
   const ivBase64  = hexToBase64(img.encryptionIv);
   const tagBase64 = hexToBase64(img.encryptionTag);
 
   return (
     <NativeEncryptedImageView
-      style={style ?? [StyleSheet.absoluteFill, { borderRadius: 16 }]}
+      style={style ?? [StyleSheet.absoluteFill, { borderRadius: 16 }]} 
       encryptedFilePath={filePath}
-      decryptionKeyBase64={decryptionKeyBase64}
+      decryptionKeyBase64={decryptionKeyBase64} 
       ivBase64={ivBase64}
-      tagBase64={tagBase64}
+      tagBase64={tagBase64}  
       resizeMode={resizeMode}
-      onLoad={onLoad}
+      onLoad={onLoad} 
     />
   );
-});
+}); 
+ 

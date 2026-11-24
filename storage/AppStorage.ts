@@ -1,56 +1,26 @@
-/**
- * WispDay — AppStorage
- * =====================================================================
- * An encrypted key-value store (MMKV) for app-level state. It is included
- * here so a reviewer can confirm two things:
- *
- *   1. The store is ENCRYPTED. MMKV is created with an `encryptionKey`, so
- *      its on-disk contents are not readable without that key.
- *
- *   2. It is encrypted with the DEVICE KEY, not the user's master key.
- *      The device key is the per-install key (see EncryptionService) that
- *      is available at boot, before any user unlock. This store must be
- *      readable that early (it holds flags the boot path needs), so it
- *      cannot depend on the master key.
- *
- * Consequence / invariant (important):
- *   Because this store is protected at the device-key level — a weaker
- *   tier than diary entries, which are protected by the user's master key
- *   — it MUST NOT hold diary content or anything that belongs behind the
- *   user's key. It holds only non-content app/session state (lock flags,
- *   session ids, lightweight preferences). Diary text, notes, categories
- *   and media never pass through here; those go through the encrypted
- *   databases keyed by the master key.
- *
- * The key fetch piggybacks on the same single-prompt coordinator used to
- * open the SQLCipher databases (see EncryptionService.getOrGenerateDeviceKey
- * / loadBiometricBundleOnce), so enabling encryption here does not add an
- * extra biometric prompt at boot.
- */
-
 import { createMMKV, MMKV } from 'react-native-mmkv';
 import { encryptionService } from '../middleware/EncryptionMiddleware';
 
-class AppStorage {
+class AppStorage { 
   private store: MMKV | null = null;
   private initPromise: Promise<void> | null = null;
 
-  // ─── BOOT (call once during app/database init) ────────────────────────────
+  // ─── BOOT (call once inside initializePowerSync) ──────────────────────────
   async init(): Promise<void> {
     if (this.store) return;
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = (async () => {
       try {
-        // The device key is already being fetched during DB init for SQLCipher;
-        // the single-prompt coordinator means this reuses the same cached
-        // result from RAM rather than triggering a second biometric prompt.
+        // Device key is already being fetched by initializePowerSync for
+        // SQLCipher — loadBiometricBundleOnce ensures it's a single prompt,
+        // and this piggybacks on the same cached result from RAM.
         const deviceKey = await encryptionService.getOrGenerateDeviceKey();
         this.store = createMMKV({
-          id: 'app_global_storage',
+          id: 'app_global_storage', 
           encryptionKey: deviceKey,
         });
-      } finally {
+      } finally { 
         this.initPromise = null;
       }
     })();
@@ -81,6 +51,7 @@ class AppStorage {
 
   delete(key: string): void {
     this.store?.remove(key);
+    // this.store?.delete(key);
   }
 
   contains(key: string): boolean {
@@ -101,5 +72,5 @@ class AppStorage {
   }
 }
 
-// One instance, used everywhere.
+// One instance, used everywhere — replaces the plain `storage` from App.tsx
 export const appStorage = new AppStorage();

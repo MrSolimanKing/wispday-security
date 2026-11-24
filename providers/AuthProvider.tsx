@@ -80,6 +80,14 @@ const encryptedStore = {
 // logout purges any plaintext that may have been written to caches.
 declare function purgeDecryptedMediaCaches(): Promise<void>;
 
+// The search mirror (decrypted copy for search, SQLCipher under its own key).
+// Published in full: database/SharedMirrorConnection.ts (close) and
+// database/wipeLocalData.ts (deletes the mirror_decrypted*.db files).
+declare function closeSharedMirrorDb(): void;
+declare function wipeLocalUserData(): Promise<void>;
+// Habit and goal mirrors — same idea, cleared on sign-out.
+declare function resetHabitAndGoalMirrors(): Promise<void>;
+
 type LogoutErrorCode = 'NO_INTERNET' | 'SERVER_ERROR' | 'UNSYNCED_CHANGES' | 'OK';
 
 
@@ -157,6 +165,9 @@ export async function logout(): Promise<LogoutErrorCode> {
 
     // 2. Clear encrypted local data and any plaintext that touched disk.
     await encryptedStore.disconnectAndClear();   // [app boundary]
+    await resetHabitAndGoalMirrors();             // [app boundary]
+    await wipeLocalUserData();                    // deletes the search mirror files (database/wipeLocalData.ts)
+    closeSharedMirrorDb();                        // closes the mirror and drops its key (database/SharedMirrorConnection.ts)
     await purgeDecryptedMediaCaches();            // [app boundary]
 
     // 3. Destroy key material (keystore references + RAM).

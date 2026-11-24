@@ -1,126 +1,141 @@
-/**
- * WispDay — EncryptionService
- * =====================================================================
- * This is the trust-critical encryption core of the WispDay journal app,
- * published for independent verification of the app's end-to-end
- * encryption claim. The app's UI, sync orchestration, media uploader and
- * AI features are NOT part of this repository; only the security layer is.
- *
- * What a reviewer can verify from this file:
- *   - Diary content, notes and media are encrypted on-device before they
- *     ever leave the app. The server only ever receives ciphertext.
- *   - Keys are derived and stored such that the server cannot reconstruct
- *     them. There is no server-side key escrow in this code path.
- *
- * Primitives
- * ----------
- *   - Content & file encryption: AES-128-GCM (authenticated; tampered
- *     ciphertext is rejected by the GCM auth tag before any plaintext is
- *     produced).
- *   - Master key: derived from a BIP-39 128-bit mnemonic. The 16-byte
- *     entropy of the mnemonic IS the AES-128 key.
- *   - Per-file keys: each media file is encrypted with a fresh random
- *     16-byte Data Encryption Key (DEK). The DEK is then wrapped
- *     (AES-128-GCM) with the master key. Only the wrapped DEK is stored.
- *   - Identity key pair: X25519, deterministically derived from the
- *     mnemonic via SHA-256 domain separation. The private key never
- *     leaves the device; only the public key is uploaded.
- *
- * Two-key model
- * -------------
- *   Device Key  — random, per-install. Encrypts the local SQLCipher
- *                 databases at rest. Persisted for the lifetime of the
- *                 install; not tied to a user account.
- *   Master Key  — per-user, derived from the BIP-39 mnemonic. Encrypts
- *                 the actual diary content. Held in RAM while unlocked;
- *                 its RAM buffer is zero-filled on background/lock (see
- *                 lockMemory) and its stored references are removed on
- *                 logout (see resetDevice).
- *   Mirror Key  — an additional independent random key for a secondary
- *                 local SQLCipher database. It is NOT derived from the
- *                 device key, so a compromised device key cannot open it.
- *
- * Key storage modes
- * -----------------
- *   Standard      — keys held in the OS keystore (iOS Keychain /
- *                   Android Keystore) with WHEN_UNLOCKED_THIS_DEVICE_ONLY
- *                   and requireAuthentication:false. Readable silently
- *                   while the device is unlocked.
- *   Biometric     — Device + Master + Mirror keys are combined into a
- *                   single JSON "bundle" stored with
- *                   requireAuthentication:true, so a Face ID / Touch ID
- *                   check is required to read them. The plaintext device
- *                   key slot is removed in this mode. A single-prompt
- *                   coordinator (loadBiometricBundleOnce) ensures
- *                   concurrent callers share one biometric prompt instead
- *                   of triggering several.
- *
- * IMPORTANT — photo/image decryption is NOT in this file
- * ------------------------------------------------------
- *   For performance, encrypted IMAGES are decrypted in a native module
- *   (a custom Objective-C / Swift component on iOS), not in this
- *   TypeScript layer. That native component:
- *     - reads the .enc file,
- *     - decrypts it in memory using the same AES-128-GCM scheme and the
- *       key material exposed here (see getRawKeyBase64 / unwrapDEK),
- *     - decodes and downsamples the bitmap and hands it to ImageIO for
- *       display,
- *   so that no plaintext image is ever written back to disk and large
- *   bitmaps are never round-tripped across the JS bridge. The native
- *   source is published separately. This file is responsible for the
- *   text/voice decryption paths and for all key derivation, wrapping and
- *   lifecycle; image decryption mirrors the same cryptographic contract
- *   in native code.
- *
- * Memory hygiene
- * --------------
- *   lockMemory() zero-fills the master-key buffer and nullifies the
- *   in-RAM key caches. It is intended to be called when the app is
- *   backgrounded or locked so key material does not linger in memory.
- *
- * Logout
- * ------
- *   resetDevice() removes the mortal (user) key references from the OS
- *   keystore and zero-fills the in-RAM key state. It does NOT itself
- *   delete the local database files or media caches — that is performed
- *   by the caller as part of the logout flow. Once those files are
- *   deleted, any key material that might survive is useless because there
- *   is no remaining ciphertext on the device to decrypt.
- *
- * NOTE FOR REVIEWERS: app-specific call sites (how the uploader, the item
- * model, or the UI invoke these methods) have been reduced to their call
- * shape only and are marked with `// [app boundary]`. The cryptographic
- * logic itself is unmodified from production.
- */
+/*
+Here is the comprehensive architectural documentation for your EncryptionMiddleware.ts and the overall security model of your application.
 
- 
+You can use this as your official technical documentation, README, or security whitepaper for the app.
 
-// ─── Imports ──────────────────────────────────────────────────────────────────
-import QuickCrypto from 'react-native-quick-crypto';   // AES-GCM, hashing, RNG, X25519
-import * as SecureStore from 'expo-secure-store';      // OS keystore (Keychain / Keystore)
+🔐 Encryption Architecture & Middleware Documentation
+1. Core Philosophy: The Dual-Key Architecture
+To achieve both seamless offline synchronization (via PowerSync) and military-grade user privacy, the application utilizes a strict Dual-Key Architecture. Encryption is handled at two entirely separate layers, utilizing two distinct keys that have different lifecycles.
+
+A. The Device Key (Immortal / Hardware-Tied)
+
+Purpose: Encrypts the local SQLite databases (diary.db and mirror_decrypted.db) at rest using SQLCipher.
+
+Lifecycle: Generated once the very first time the app is opened after installation. It is immortal—it is never deleted or rotated until the user physically uninstalls the app.
+
+Identity: It is tied exclusively to the physical device, not to a specific user.
+
+Why? SQLite and PowerSync require a stable, persistent key to maintain database integrity across app restarts, schema migrations, and user sessions.
+
+B. The Master Key (Mortal / User-Tied)
+
+Purpose: Encrypts the actual diary content, text, notes, and media files at the application level using AES-128-GCM.
+
+Lifecycle: Generated from a BIP-39 12-word mnemonic phrase when a user registers. It is mortal—it is mathematically shredded from RAM and deleted from standard storage the moment a user logs out.
+
+Identity: It is tied exclusively to the user's secure session.
+
+Why? If a user logs out, their local database is physically wiped. However, even if fragments of the database survived on the disk, the data is permanently unreadable because the user's Master Key has been destroyed.
+
+2. Security Modes & Vault Binding
+The EncryptionMiddleware operates in two distinct states, depending on the user's preference.
+
+Mode 1: Standard Security (Vault Binding OFF)
+
+Storage: Keys are stored in the iOS/Android Secure Enclave with the policy WHEN_UNLOCKED_THIS_DEVICE_ONLY and requireAuthentication: false.
+
+Behavior: The OS allows the app to read the keys silently in the background as long as the phone itself is unlocked.
+
+Keys: The Device Key and Master Key are stored in separate slots (STORAGE_KEYS.DEVICE_DB_KEY and STORAGE_KEYS.MASTER_KEY).
+
+Mode 2: Maximum Security (Vault Binding ON)
+
+Storage: Keys are stored with the policy requireAuthentication: true. The OS mandates a successful Biometric scan (Face ID / Touch ID) every time the keys are read.
+
+The Bundle: To prevent iOS from prompting the user for Face ID multiple times, the Device Key and Master Key are combined into a single JSON string (The Biometric Bundle) and stored under STORAGE_KEYS.BUNDLED_KEY.
+
+Hardware Enforcement: The plain-text DEVICE_DB_KEY is completely obliterated from standard storage. This means the SQLCipher databases literally cannot be opened by the OS without a successful Face ID scan.
+
+Tamper Proofing: Because the keys are bound to the hardware enclave, if a bad actor attempts to change or disable the device's Face ID in the OS settings, the OS permanently destroys the bundle, locking the database forever.
+
+3. The "Single-Prompt" Coordinator (RAM Caching)
+Because SQLCipher needs the Device Key to boot, and the Auth Provider needs the Master Key to show the UI, a race condition occurs on startup that would normally trigger two back-to-back Face ID alerts.
+
+The middleware solves this using the loadBiometricBundleOnce() Promise Lock:
+
+When the app boots, AppDatabase.ts asks for the Device Key.
+
+The middleware triggers Face ID.
+
+Upon success, the middleware extracts both keys from the bundle.
+
+It sets the Master Key into the active AES-GCM class instance.
+
+It caches the Device Key in a pure RAM variable (extractedDeviceKey).
+
+A millisecond later, when the Auth flow asks for the Master Key, the middleware instantly resolves it from RAM without prompting Face ID again.
+
+Security Guarantee: The unencrypted Device Key never touches the disk during this process. If the app is killed, the RAM is cleared, and Face ID is required again.
+
+4. Lifecycle & Session Management
+Logging In / Registering (persistKey)
+
+When a user authenticates, a Master Key is created/imported.
+
+If Vault Binding is OFF, it saves to the standard MASTER_KEY slot.
+
+If Vault Binding is ON, it fetches the immortal Device Key, bundles it with the new Master Key, and overwrites the BUNDLED_KEY slot behind Face ID.
+
+Logging Out (resetDevice)
+
+Logging out requires careful handling to avoid background Face ID crashes (which occur if the app requests biometrics while the UI is transitioning/backgrounded).
+
+The app physically deletes the SQLite database files (diary.db, mirror.db) and all local media caches.
+
+The middleware deletes the MASTER_KEY from standard storage.
+
+The Biometric Bundle is left untouched. * Why? Attempting to edit the bundle during logout would trigger a Face ID prompt and crash the app in the background.
+
+Is it secure? Yes. Because the database files are physically destroyed in step 1, the old Master Key left inside the Face ID bundle is rendered completely useless (there is zero data left on the device for it to decrypt).
+
+The immortal Device Key inside that bundle is preserved safely for the next user. When a new user logs in, persistKey simply overwrites the old bundle.
+
+5. Middleware API Reference (encryptionService)
+getOrGenerateDeviceKey(): Fetches the immortal DB key. Routes through the Face ID coordinator if Max Security is enabled.
+
+generateMasterKey(): Creates a fresh BIP-39 mnemonic, derives the AES key, and saves it based on current security settings. Returns a verification phrase for the server.
+
+importMasterKey(mnemonic, verifier): Derives a key from an existing 12-word phrase and checks it against the server's verifier.
+
+setKeyProtection(requireBiometric: boolean): The migration function. Safely moves keys between Standard storage and Biometric Bundle storage based on user settings, destroying the plain-text traces when upgrading.
+
+encrypt(text) / decrypt(bundle): Synchronous AES-128-GCM operations for UI data.
+
+encryptFile(uri) / decryptFile(uri): Single-pass AES-128-GCM operations.
+  - encryptFile: reads plaintext → encrypts in memory → writes .enc to disk → returns { path, iv, tag }.
+    The plaintext source is NOT deleted here; the caller is responsible for
+    cleaning up the original (e.g. after a successful upload).
+  - decryptFile: reads .enc from disk → decrypts in memory → returns base64 string.
+    The caller feeds this directly to <Image> as data:image/jpeg;base64,...
+    Nothing plaintext ever touches the disk.
+
+lockMemory(): Zero-fills the this.key buffer and nullifies the RAM caches. Used when the app is thrown into the background to ensure memory scraping cannot reveal the keys.
+*/
+
+
+// ─── Unchanged imports ────────────────────────────────────────────────────────
+import QuickCrypto from 'react-native-quick-crypto';
+import * as SecureStore from 'expo-secure-store';
+// react-native-fs removed — Paths from nitro-file-system replaces RNFS.DocumentDirectoryPath
 import { Buffer } from 'buffer';
-import * as bip39 from 'bip39';                         // BIP-39 mnemonic ↔ entropy
-import { createMMKV } from 'react-native-mmkv';         // fast KV store for the mode flag
-import fs, { Paths } from 'react-native-nitro-file-system'; // JSI file I/O for media
-
-// ── [app boundary] ────────────────────────────────────────────────────────────
-// In the app this is the shared key-value store (MMKV). The security core only
-// reads ONE flag from it: `fresh_login_lock`, a transient boolean the login flow
-// sets to force a manual unlock right after sign-in (so auto-unlock can't bypass
-// it). Nothing security-critical is persisted here. Stubbed to a minimal getter
-// so this file stands alone; swap in your own store to run it in-app.
-const appStorage = {
-  getBoolean: (_key: string): boolean | undefined => undefined,
-};
+import * as bip39 from 'bip39';
+import { createMMKV } from 'react-native-mmkv';
+import { Buffer as NitroBuffer } from 'react-native-nitro-buffer';
+// ─── New imports (replaces AesGcmCrypto + expo-file-system/legacy) ────────────
+// react-native-nitro-file-system  →  fast, Node.js-compatible JSI file I/O
+// react-native-quick-crypto       →  already imported above; now also handles files
+import fs, { Paths } from 'react-native-nitro-file-system';
+import { appStorage } from '../storage/AppStorage';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const ALGORITHM       = 'aes-128-gcm';   // text & DEK encryption
-const IV_LENGTH       = 12;              // 96-bit IV (GCM standard)
-const KEY_LENGTH      = 16;              // 128-bit key
-const AUTH_TAG_LENGTH = 16;              // 128-bit auth tag
+const ALGORITHM     = 'aes-128-gcm';   // text encryption  (unchanged)
+const IV_LENGTH     = 12;              // 96-bit IV for GCM (unchanged)
+const KEY_LENGTH    = 16;              // 128-bit key       (unchanged)
+const AUTH_TAG_LENGTH = 16;            // 128-bit auth tag  (unchanged)
 
-// File encryption uses the same AES-128-GCM primitive as text. The GCM auth tag
-// means a tampered .enc file is rejected before any plaintext is produced.
+// File encryption — now also AES-128-GCM (was AES-128-CTR).
+// Same algorithm & key as text; one consistent primitive across the whole app.
+// GCM adds an auth tag so tampered .enc files are rejected before any data leaks.
 const ALGORITHM_FILE  = 'aes-128-gcm';
 const IV_LENGTH_FILE  = 12;            // 96-bit IV (GCM standard)
 
@@ -130,8 +145,8 @@ const VERIFICATION_PHRASE = 'DIARY_VERIFICATION_v1';
 type ProgressCallback = (progress: number) => void;
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
-const securityStorage = createMMKV({ id: 'security_settings' });
-// Persisted flag selecting biometric (Face ID / Touch ID) key storage vs standard.
+const securityStorage    = createMMKV({ id: 'security_settings' });
+// const MMKV_BIOMETRIC_KEY = 'max_security_enabled';
 const MMKV_BIOMETRIC_KEY = 'vault_key_binding_enabled';
  
 const STORAGE_KEYS = {
@@ -190,6 +205,8 @@ class EncryptionService {
 
   // 🛡️ SINGLE-PROMPT COORDINATOR
   private biometricBundleLoaded: boolean = false;
+  /** The master key from the latest persistKey() was written into the Face ID bundle (write succeeded). */
+  private masterKeySavedInBundle: boolean = false;
   private biometricBundlePromise: Promise<BundledKeys | null> | null = null;
 
   private extractedMirrorKey: string | null = null;
@@ -222,6 +239,18 @@ class EncryptionService {
    */
   public armUnlockAttempt(): void {
     this.promptSuppressed = false;
+  }
+
+  /**
+   * The background lock (Maximum Security / Vault): the same wipe as lockMemory(), and in Face ID
+   * mode no new Face ID may start until the lock screen asks for one (armUnlockAttempt). Without
+   * this, a database read still finishing in the background asked for the keys by itself: its
+   * Face ID showed on the way back and loaded the keys, but the lock screen hadn't asked, so it
+   * stayed (and the next quick return showed no Face ID at all). Nothing stored is touched.
+   */
+  public lockForBackground(): void {
+    this.lockMemory();
+    if (this.isBiometricProtectionEnabled()) this.promptSuppressed = true;
   }
 
   public isBiometricProtectionEnabled(): boolean {
@@ -282,7 +311,8 @@ class EncryptionService {
     }
 
     // 4. Trigger Face ID exactly once and cache both keys instantly
-    this.biometricBundlePromise = (async () => {
+    let thisRead: Promise<BundledKeys | null> | null = null;
+    thisRead = (async () => {
       try {
         // Per expo-secure-store semantics:
         //   • getItemAsync THROWS when auth is unavailable right now — i.e. the
@@ -301,7 +331,7 @@ class EncryptionService {
               this.key     = Buffer.from(bundled.masterKey, 'base64');
               this.isReady = true;
             }
-            if (bundled.mirrorKey) this.extractedMirrorKey = bundled.mirrorKey;
+            if (bundled.mirrorKey) this.extractedMirrorKey = bundled.mirrorKey;  // ← add
             this.biometricBundleLoaded = true;
             this.lastFailureKind = null;
             this.promptSuppressed = false;
@@ -324,11 +354,14 @@ class EncryptionService {
         this.promptSuppressed = true;
         return null;
       } finally {
-        this.biometricBundlePromise = null;
+        // Only forget THIS read: a lock in between may have started a newer one (the lock
+        // screen's), which other callers must keep sharing instead of opening a second Face ID.
+        if (this.biometricBundlePromise === thisRead) this.biometricBundlePromise = null;
       }
     })();
+    this.biometricBundlePromise = thisRead;
 
-    return this.biometricBundlePromise;
+    return thisRead;
   }
 
   public async getOrGenerateDeviceKey(): Promise<string> {
@@ -373,7 +406,7 @@ class EncryptionService {
         const plainKey = await SecureStore.getItemAsync(STORAGE_KEYS.DEVICE_DB_KEY);
         // if (plainKey) return plainKey;
         if (plainKey) {
-          this.extractedDeviceKey = plainKey; // cache in RAM for the paths that reuse it
+          this.extractedDeviceKey = plainKey; // ⚡ ADD THIS
           return plainKey;
         }
 
@@ -417,9 +450,9 @@ class EncryptionService {
 
 
   /**
-   * Returns the secondary local database's INDEPENDENT SQLCipher key.
+   * Returns the mirror DB's INDEPENDENT SQLCipher key.
    * Random, separately stored — NOT derived from the device key, so a compromised
-   * device key cannot open this database.
+   * device key cannot open the (decrypted-content) mirror database.
    */
   public async getOrGenerateMirrorKey(): Promise<string> {
   if (this.extractedMirrorKey) return this.extractedMirrorKey;
@@ -430,7 +463,7 @@ class EncryptionService {
       this.extractedMirrorKey = bundled.mirrorKey;
       return bundled.mirrorKey;
     }
-    // Bundle exists but has no secondary key yet (first run after upgrade) → mint + merge.
+    // Bundle exists but has no mirror key yet (first run after upgrade) → mint + merge.
     if (bundled?.deviceKey) {
       const key = Buffer.from(QuickCrypto.randomBytes(32)).toString('hex');
       await this._mergeMirrorKeyIntoBundle(key, bundled);
@@ -486,6 +519,7 @@ class EncryptionService {
         keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         requireAuthentication: false,
       });
+      void this.removePlainMnemonicAfterSave(); // Maximum Security only; see the method
 
       return { success: true, verifier, mnemonic };
     } catch (error) {
@@ -516,6 +550,7 @@ class EncryptionService {
         keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         requireAuthentication: false,
       });
+      void this.removePlainMnemonicAfterSave(); // Maximum Security only; see the method
 
       return true;
     } catch (e) {
@@ -550,7 +585,7 @@ class EncryptionService {
           keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
           requireAuthentication: true,
         });
-        console.log('✅ [Encryption] Stale biometric master key cleared.');
+        console.log('✅ [Encryption] Biometric ghost vault successfully cleared.');
         return true;
       }
     } catch (error) {
@@ -560,6 +595,65 @@ class EncryptionService {
     
     return true; // Bundle didn't exist or was already clean
   }
+
+  // 🛡️ autoUnlock now handles Verifier Checks and the Fresh Login MMKV Lock
+  // public async autoUnlock(expectedVerifier?: string): Promise<boolean> {
+  //   try {
+  //     // 1. FRESH LOGIN LOCK: Force 12-word entry for new sessions
+  //     if (appStorage.getBoolean('fresh_login_lock')) {
+  //       console.log('🔒 [Encryption] Fresh login detected. Bypassing auto-unlock.');
+  //       return false;
+  //     }  
+
+  //     if (this.isBiometricProtectionEnabled()) {
+  //       const bundled = await this.loadBiometricBundleOnce();
+  //       if (!bundled) {
+  //         this.deviceKeyPromise = null;
+  //         return false;
+  //       }
+
+  //       await SecureStore.deleteItemAsync(STORAGE_KEYS.DEVICE_DB_KEY).catch(() => {});
+  //       if (!bundled.masterKey) return false; 
+
+  //       this.key = Buffer.from(bundled.masterKey, 'base64');
+  //       this.isReady = true;
+
+  //       // 2. CROSS-ACCOUNT GHOST KEY CHECK
+  //       if (expectedVerifier) {
+  //         const check = this.decrypt(expectedVerifier);
+  //         if (check !== VERIFICATION_PHRASE) {
+  //           console.warn('🛑 [Encryption] Cross-Account Ghost Key detected! Rejecting auto-unlock.');
+  //           this.lockMemory();
+  //           return false;
+  //         }
+  //       }
+
+  //       console.log('✅ [Encryption] Auto-unlocked securely');
+  //       return true;
+
+  //     } else {
+  //       const storedKey = await this.loadKeyFromDevice();
+  //       if (storedKey) {
+  //         this.key = storedKey;
+  //         this.isReady = true;
+          
+  //         if (expectedVerifier) {
+  //           const check = this.decrypt(expectedVerifier);
+  //           if (check !== VERIFICATION_PHRASE) {
+  //             console.warn('🛑 [Encryption] Cross-Account Ghost Key detected! Rejecting auto-unlock.');
+  //             this.lockMemory();
+  //             return false;
+  //           }
+  //         }
+  //         return true;
+  //       }
+  //       return false;
+  //     }
+  //   } catch (error) {
+  //     this.deviceKeyPromise = null;
+  //     return false;
+  //   }
+  // }
 
   public async autoUnlock(expectedVerifier?: string): Promise<boolean> {
   try {
@@ -575,7 +669,7 @@ class EncryptionService {
         return false;
       }
 
-      // Cache the keys from the bundle before touching the standalone slot.
+      // Cache device + mirror keys from the bundle before touching the standalone slot.
       this.extractedDeviceKey = bundled.deviceKey;
       this.extractedMirrorKey = bundled.mirrorKey ?? null;
 
@@ -584,7 +678,7 @@ class EncryptionService {
       // Guest-with-vault: Face ID succeeded, device key present, no master key yet.
       if (!bundled.masterKey) {
         this.biometricBundleLoaded = true;
-        console.log('🔑 [Encryption] Guest unlocked via biometric bundle (no master key yet).');
+        console.log('🔑 [Encryption] Vault guest unlocked (no master key yet).');
         this.notifyKeyChange(); // ✅ Signal sent
         return true;
       }
@@ -603,10 +697,11 @@ class EncryptionService {
       
       console.log('✅ [Encryption] Auto-unlocked securely');
       this.notifyKeyChange(); // ✅ Signal sent
+      void this.removePlainMnemonicIfVaulted(); // in the background, never blocks the unlock
       return true;
 
     } else {
-      // Standard mode: ensure the device key is in RAM (needed by dependent paths).
+      // Standard mode: ensure device key is in RAM (needed for guests + mirror).
       await this.getOrGenerateDeviceKey();
       const storedKey = await this.loadKeyFromDevice();
 
@@ -623,14 +718,14 @@ class EncryptionService {
         }
         
         console.log('✅ [Encryption] Standard mode unlocked securely');
-        this.notifyKeyChange(); // signal subscribers that key state changed
+        this.notifyKeyChange(); // 🟢 THE FIX: You were missing the signal here!
         return true;
       }
 
       // Standard guest: has a device key, no master key → valid unlocked state.
       if (this.extractedDeviceKey) {
         console.log('🔑 [Encryption] Standard guest unlocked (device key only).');
-        this.notifyKeyChange(); // signal subscribers that key state changed
+        this.notifyKeyChange(); // 🟢 THE FIX: You were missing the signal here too!
         return true;
       }
       return false;
@@ -661,8 +756,8 @@ class EncryptionService {
 
 
   /**
-   * Adds the secondary key into the EXISTING biometric bundle, preserving device+master.
-   * Used when an older bundle (created before this key existed) is opened in biometric mode.
+   * Adds a mirror key into the EXISTING biometric bundle, preserving device+master.
+   * Used when an older bundle (pre-mirror-key) is opened in Max mode.
    */
   private async _mergeMirrorKeyIntoBundle(mirrorKey: string, current: BundledKeys): Promise<void> {
     const merged: BundledKeys = {
@@ -674,7 +769,7 @@ class EncryptionService {
       keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       requireAuthentication: true,
     });
-    // best-effort: remove any stray standalone slot so there's one source of truth
+    // best-effort: remove any stray standalone mirror slot so there's one source of truth
     await SecureStore.deleteItemAsync(STORAGE_KEYS.MIRROR_DB_KEY).catch(() => {});
   }
  
@@ -715,7 +810,13 @@ class EncryptionService {
     if (requireBiometric) {
       // 1. WRITE the new bundle (this is the Face ID prompt). If it throws/cancels,
       //    nothing has been deleted yet → prior standard-storage keys are intact.
-      const bundle: BundledKeys = { deviceKey, masterKey: masterKeyB64, mirrorKey };
+      // const bundle: BundledKeys = { deviceKey, masterKey: masterKeyB64 };
+      // await SecureStore.setItemAsync(STORAGE_KEYS.BUNDLED_KEY, JSON.stringify(bundle), {
+      //   keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      //   requireAuthentication: true,
+      // });
+
+      const bundle: BundledKeys = { deviceKey, masterKey: masterKeyB64, mirrorKey };  // ← add mirrorKey
       await SecureStore.setItemAsync(STORAGE_KEYS.BUNDLED_KEY, JSON.stringify(bundle), {
         keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         requireAuthentication: true,
@@ -750,6 +851,7 @@ class EncryptionService {
       // 5. Commit the flag LAST — boot only trusts biometric mode once the bundle
       //    is proven to exist. If we crashed before here, boot still finds plaintext.
       securityStorage.set(MMKV_BIOMETRIC_KEY, true);
+      void this.removePlainMnemonicIfVaulted();
 
     } else {
       // ── DISABLE PATH (biometric → standard) ─────────────────────────────────
@@ -802,6 +904,19 @@ class EncryptionService {
 
       // 5. Commit the flag LAST.
       securityStorage.set(MMKV_BIOMETRIC_KEY, false);
+
+      // 6. Standard mode keeps the 12 words in the Keychain, as before: restore them if
+      //    Maximum Security had removed the plain copy. (Write only; nothing is deleted.)
+      try {
+        const hasPlain = await SecureStore.getItemAsync(STORAGE_KEYS.MNEMONIC).catch(() => null);
+        const words = hasPlain ? null : this.mnemonicFromMasterKey();
+        if (words) {
+          await SecureStore.setItemAsync(STORAGE_KEYS.MNEMONIC, words, {
+            keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+            requireAuthentication: false,
+          });
+        }
+      } catch {}
     }
 
     // Force the next device-key fetch to re-resolve under the new mode.
@@ -815,15 +930,78 @@ class EncryptionService {
 
   public async getMnemonicString(): Promise<string | null> {
     try {
-      return await SecureStore.getItemAsync(STORAGE_KEYS.MNEMONIC);
+      const stored = await SecureStore.getItemAsync(STORAGE_KEYS.MNEMONIC);
+      if (stored) return stored;
     } catch (error) {
+      // fall through to the key in memory
+    }
+    // Maximum Security: no plain copy is kept – the 12 words are the master key itself
+    // (BIP-39 entropy), so they're rebuilt from the key that Face ID unlocked.
+    return this.mnemonicFromMasterKey();
+  }
+
+  /**
+   * The 12-word phrase for the master key in memory. The master key IS the phrase's BIP-39
+   * entropy (see generateMasterKey / importMasterKey), so this gives back exactly the same words.
+   * null when no 16-byte master key is loaded.
+   */
+  private mnemonicFromMasterKey(): string | null {
+    try {
+      if (!this.key || this.key.length !== 16) return null;
+      return bip39.entropyToMnemonic(this.key.toString('hex'));
+    } catch {
       return null;
     }
   }
 
+  /**
+   * Maximum Security / Vault mode: the plain copy of the 12 words would let anyone who reads the
+   * Keychain of an unlocked phone rebuild the master key without Face ID. Remove it – but only
+   * when it's provably redundant:
+   *   • biometric protection is on and the master key was just read from the Face ID bundle;
+   *   • the words rebuilt from that key are EXACTLY the stored words.
+   * Nothing is written and the bundle is never touched, so this can't lock anyone out: unlocking
+   * never used the plain phrase. "Show recovery key" and the identity key rebuild it from the key.
+   */
+  /**
+   * Right after signing in / restoring in Maximum Security: same cleanup, but ONLY if this very
+   * key was just written into the Face ID bundle by persistKey(). (If persistKey couldn't write it
+   * – e.g. no device key found – the plain phrase may be the only saved copy: it's kept.)
+   */
+  private async removePlainMnemonicAfterSave(): Promise<void> {
+    if (!this.masterKeySavedInBundle) return;
+    await this.removePlainMnemonicIfVaulted();
+  }
+
+  private async removePlainMnemonicIfVaulted(): Promise<void> {
+    try {
+      if (!this.isBiometricProtectionEnabled() || !this.biometricBundleLoaded || !this.key) return;
+      const stored = await SecureStore.getItemAsync(STORAGE_KEYS.MNEMONIC).catch(() => null);
+      if (!stored) return;
+      const rebuilt = this.mnemonicFromMasterKey();
+      if (!rebuilt || rebuilt !== stored) return; // not provably the same: keep it
+      await SecureStore.deleteItemAsync(STORAGE_KEYS.MNEMONIC);
+      console.log('🔐 [Encryption] Plain recovery phrase removed (protected by the Face ID bundle).');
+    } catch {
+      // best effort – never affects unlocking
+    }
+  }
+
+  // private async persistKey(keyBuffer: Buffer): Promise<void> {
+  //   await SecureStore.setItemAsync(
+  //     STORAGE_KEYS.MASTER_KEY,
+  //     keyBuffer.toString('base64'),
+  //     {
+  //       keychainAccessible:    SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  //       requireAuthentication: false,
+  //     }
+  //   );
+  // }
+
   private async persistKey(keyBuffer: Buffer): Promise<void> {
+    this.masterKeySavedInBundle = false;
     if (this.isBiometricProtectionEnabled()) {
-      // Biometric mode: write the new master key into the bundle (Face ID gated).
+      // 🛡️ FIX 3: Write new keys to the Vault if Vault Binding is active
       let deviceKey = this.extractedDeviceKey || await SecureStore.getItemAsync(STORAGE_KEYS.DEVICE_DB_KEY);
       
       if (!deviceKey) {
@@ -839,6 +1017,8 @@ class EncryptionService {
         });
         this.extractedDeviceKey = deviceKey; 
         this.biometricBundleLoaded = true;
+        // The Keychain accepted the write (it throws otherwise): this key is in the bundle.
+        this.masterKeySavedInBundle = keyBuffer.equals(this.key ?? Buffer.alloc(0));
       }
       
       // Ensure no traces are left in standard storage
@@ -865,28 +1045,45 @@ class EncryptionService {
     }
   }
 
+  // public async resetDevice(): Promise<void> {
+  //   await Promise.all([
+  //     SecureStore.deleteItemAsync(STORAGE_KEYS.MASTER_KEY),
+  //     // SecureStore.deleteItemAsync(STORAGE_KEYS.BUNDLED_KEY),
+  //   ]).catch(() => {});
+  //   this.cleanup();
+  // }
+
 public async resetDevice(): Promise<void> {
     console.log('🧹 [Encryption] Wiping mortal user keys...');
 
-    // 1. Remove the mortal (user) keys from the OS keystore. This is silent and
-    //    never prompts for biometrics.
+    // 1. Delete standard storage keys (Always works silently, no Face ID required)
     await Promise.all([
       SecureStore.deleteItemAsync(STORAGE_KEYS.MASTER_KEY),
       SecureStore.deleteItemAsync(STORAGE_KEYS.MNEMONIC),
       SecureStore.deleteItemAsync(STORAGE_KEYS.IDENTITY_PRIVATE),
     ]).catch(() => {});
 
-    // 2. The biometric bundle is deliberately NOT rewritten here. Editing a
-    //    requireAuthentication:true entry would trigger a Face ID prompt, which
-    //    can crash if logout runs while the app is backgrounding. It is safe to
-    //    leave: the immortal device key inside it is reused by the next user,
-    //    and any master key inside it is useless once the local databases are
-    //    deleted (see note below).
-    //
-    // NOTE: this function does NOT delete the local SQLCipher databases or media
-    // caches. The logout flow in the app performs that file deletion. Removing
-    // the key references and zero-filling RAM (cleanup) is this function's job;
-    // destroying the ciphertext on disk is the caller's.
+    // 2. Scrub the Biometric Bundle (Keep Device Key, drop Master Key)
+    // THIS IS REQUIRED so hasExistingMasterKey() doesn't get blocked by a ghost key!
+    // if (this.isBiometricProtectionEnabled()) {
+    //   try {
+    //     const bundledRaw = await SecureStore.getItemAsync(STORAGE_KEYS.BUNDLED_KEY);
+    //     const bundled = parseBundledKeys(bundledRaw);
+
+    //     if (bundled?.deviceKey) {
+    //       // Overwrite the bundle: keep the immortal deviceKey, but shred the masterKey
+    //       const cleanBundle = { deviceKey: bundled.deviceKey, masterKey: null };
+    //       await SecureStore.setItemAsync(STORAGE_KEYS.BUNDLED_KEY, JSON.stringify(cleanBundle), {
+    //         keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    //         requireAuthentication: true,
+    //       });
+    //       console.log('✅ [Encryption] Biometric bundle successfully scrubbed.');
+    //     }
+    //   } catch (error) {
+    //     console.warn('⚠️ [Encryption] Could not scrub biometric bundle (likely cancelled).');
+    //   }
+    // } 
+
     this.cleanup();
   }
 
@@ -936,7 +1133,8 @@ public async resetDevice(): Promise<void> {
     try {
       // 1. Derive a deterministic seed from the mnemonic
       //    Different path from the master key — append "identity" to distinguish
-      const mnemonic = await SecureStore.getItemAsync(STORAGE_KEYS.MNEMONIC);
+      const mnemonic = (await SecureStore.getItemAsync(STORAGE_KEYS.MNEMONIC).catch(() => null))
+        ?? this.mnemonicFromMasterKey(); // Maximum Security: rebuilt from the key (identical words)
       if (!mnemonic) return null;
 
       // Use HKDF-style domain separation: hash(mnemonic + "identity")
@@ -974,16 +1172,13 @@ public async resetDevice(): Promise<void> {
   // ─── Text encryption (UNCHANGED) ──────────────────────────────────────────
 
   public encrypt(text: string): string | null {
+    // if (!this.isReady || !this.key) return null;
     const encryptionKey = this.key || this.getGuestFallbackKey();
     if (!encryptionKey) return null;
 
     try {
       const iv      = QuickCrypto.randomBytes(IV_LENGTH);
-      // NOTE (fixed for public release): production passed `this.key` here,
-      // which is null for guest users even though `encryptionKey` resolved to
-      // the guest fallback. Using the resolved key makes encrypt/decrypt
-      // symmetric for guests. Mirror this fix in the app.
-      const cipher  = QuickCrypto.createCipheriv(ALGORITHM, encryptionKey, iv);
+      const cipher  = QuickCrypto.createCipheriv(ALGORITHM, this.key, iv);
       let encrypted = cipher.update(text, 'utf8', 'base64');
       encrypted    += cipher.final('base64');
       const authTag = cipher.getAuthTag().toString('base64');
@@ -993,7 +1188,25 @@ public async resetDevice(): Promise<void> {
     }
   }
 
+  // public decrypt(encryptedBundle: string): string {
+  //   if (!this.isReady || !this.key) return '🔒 Locked';
+  //   if (!encryptedBundle?.includes(':'))  return '⚠️ Invalid Data';
 
+  //   try {
+  //     const parts = encryptedBundle.split(':');
+  //     if (parts.length !== 3) return '⚠️ Corrupted';
+  //     const [iv, tag, content] = parts;
+
+  //     const decipher = QuickCrypto.createDecipheriv(ALGORITHM, this.key, Buffer.from(iv, 'base64'));
+  //     decipher.setAuthTag(Buffer.from(tag, 'base64'));
+
+  //     let decrypted  = decipher.update(content, 'base64', 'utf8');
+  //         decrypted += decipher.final('utf8');
+  //     return decrypted;
+  //   } catch (error) {
+  //     return '🚫 Unreadable';
+  //   }
+  // }
 
   public decrypt(encryptedBundle: string): string {
     const keysToTry = [];
@@ -1008,7 +1221,7 @@ public async resetDevice(): Promise<void> {
     if (parts.length !== 3) return '⚠️ Corrupted';
     const [iv, tag, content] = parts;
 
-    // Try the master key first, then the device-derived guest fallback key.
+    // ⚡ FIX: Try Master Key, then Guest Key
     for (const decryptionKey of keysToTry) {
       try {
         const decipher = QuickCrypto.createDecipheriv(ALGORITHM, decryptionKey, Buffer.from(iv, 'base64'));
@@ -1024,7 +1237,30 @@ public async resetDevice(): Promise<void> {
     return '🚫 Unreadable';
   }
 
-  
+  // ─── File encryption (REWRITTEN) ──────────────────────────────────────────
+  //
+  // What changed vs the old implementation:
+  //   • Removed: AesGcmCrypto  (react-native-aes-gcm-crypto)
+  //   • Removed: expo-file-system/legacy  (FileSystem.copyAsync, writeAsStringAsync, etc.)
+  //   • Removed: react-native-fs (RNFS.stat, RNFS.exists, RNFS.unlink)
+  //   • Added:   react-native-nitro-file-system  (NitroFile — fast JSI reads/writes)
+  //   • Added:   QuickCrypto already present above; now also used for file ops
+  //   • Algorithm: AES-128-CTR → AES-128-GCM  (tamper-evident auth tag on every file)
+  //   • Strategy:  single-pass in-memory (correct for ≤5 MB photos/audio in v0)
+  //
+  // Return contract is IDENTICAL to the old version:
+  //   encryptFile → { path: string; iv: string; tag: string } | null
+  //   decryptFile → base64 string | null   (NEW: was boolean; caller now gets data URI)
+  //
+  // Callers that previously used:
+  //   file.cryptoResult.iv  /  file.cryptoResult.tag
+  // require NO changes — the field names are the same.
+  //
+  // The decryptFile return type changes from boolean to string | null.
+  // Update the call site to:
+  //   const base64 = await encryptionService.decryptFile(path, iv, tag);
+  //   if (base64) { uri = `data:image/jpeg;base64,${base64}`; }
+
   /**
    * Encrypts a media file using AES-128-GCM.
    *
@@ -1045,8 +1281,8 @@ public async resetDevice(): Promise<void> {
   ): Promise<{ path: string; iv: string; tag: string; encrypted_dek: string; dek_iv: string; dek_tag: string } | null> {
     // if (!this.isReady || !this.key) return null;
 
-    // If neither a master key nor a device key is in RAM (e.g. just after logout),
-    // load the device key so the guest fallback key can be derived.
+    // 🟢 THE FIX: If there is no Master Key and no Device Key in RAM (e.g. freshly logged out),
+    // aggressively fetch the Device Key back into RAM so the Guest Fallback key can generate.
     if (!this.key && !this.extractedDeviceKey) {
       await this.getOrGenerateDeviceKey();
     }
@@ -1063,20 +1299,20 @@ public async resetDevice(): Promise<void> {
       const plainData   = Buffer.from(plainBase64, 'base64');
 
       // ── Step 2: Generate a fresh DEK for this file ────────────────────────
-      const dek = QuickCrypto.randomBytes(KEY_LENGTH);   // fresh 16-byte per-file DEK
+      const dek = QuickCrypto.randomBytes(KEY_LENGTH);   // ← NEW: 16-byte DEK
 
-      // ── Step 3: Encrypt the file with the per-file DEK (never the master key) ──
+      // ── Step 3: Encrypt file with DEK (not master key) ────────────────────
       const iv     = QuickCrypto.randomBytes(IV_LENGTH_FILE);
-      const cipher = QuickCrypto.createCipheriv(ALGORITHM_FILE, dek, iv);
+      const cipher = QuickCrypto.createCipheriv(ALGORITHM_FILE, dek, iv);  // ← dek, not this.key
 
       const encPart1   = cipher.update(plainData);
       const encPart2   = cipher.final();
       const authTag    = cipher.getAuthTag();
       const ciphertext = Buffer.concat([encPart1, encPart2]);
 
-      // ── Step 4: Wrap the DEK with the master key ──────────────────────────────
-      const wrapped = this.wrapDEK(dek);
-      dek.fill(0);                                        // zero-fill the DEK from RAM immediately after wrapping
+      // ── Step 4: Wrap DEK with master key ──────────────────────────────────
+      const wrapped = this.wrapDEK(dek);                 // ← NEW
+      dek.fill(0);                                        // ← NEW: zero-fill DEK from RAM immediately
       if (!wrapped) throw new Error('DEK wrap failed');
 
       // ── Step 5: Write ciphertext to disk ─────────────────────────────────
@@ -1087,9 +1323,9 @@ public async resetDevice(): Promise<void> {
         path:          encryptedOutPath,
         iv:            iv.toString('hex'),
         tag:           authTag.toString('hex'),
-        encrypted_dek: wrapped.encrypted_dek,
-        dek_iv:        wrapped.dek_iv,
-        dek_tag:       wrapped.dek_tag,
+        encrypted_dek: wrapped.encrypted_dek,            // ← NEW
+        dek_iv:        wrapped.dek_iv,                   // ← NEW
+        dek_tag:       wrapped.dek_tag,                  // ← NEW
       };
 
     } catch (error) {
@@ -1101,7 +1337,185 @@ public async resetDevice(): Promise<void> {
     }
   }
 
+  /**
+   * Decrypts a .enc media file into a base64 string — nothing is written to disk.
+   *
+   * Flow:
+   *   1. Read the entire .enc file into memory via NitroFile.
+   *   2. Verify & decrypt with QuickCrypto AES-128-GCM (GCM auth tag prevents
+   *      tampered files from returning any data — it throws before decrypting).
+   *   3. Return the plaintext as a base64 string.
+   *
+   * Caller usage:
+   *   const base64 = await encryptionService.decryptFile(path, iv, tag);
+   *   if (base64) {
+   *     const uri = `data:image/jpeg;base64,${base64}`;
+   *     // Pass uri to <Image source={{ uri }} /> — no temp file, zero disk exposure.
+   *   }
+   *
+   * ⚠️  Return type changed from boolean → string | null.
+   *     Update the call site accordingly (see comment above).
+   *
+   * @param encryptedPath  Path to the .enc file on disk.
+   * @param ivBase64       IV returned by encryptFile (base64 string).
+   * @param tagBase64      Auth tag returned by encryptFile (base64 string).
+   * @returns              Base64-encoded plaintext on success, null on failure/tamper.
+   */
+  /**
+   * Decrypts a .enc media file into a base64 string — nothing is written to disk.
+   */
+  public async decryptFile(
+    encryptedPath: string,
+    ivHex: string,
+    tagHex: string,
+    encrypted_dek?: string,   // ← Make optional for legacy support
+    dek_iv?: string,          // ← Make optional
+    dek_tag?: string,         // ← Make optional
+  ): Promise<string | null> {
+    if (!this.isReady || !this.key) return null;
 
+    try {
+      // ── Step 1: Resolve the Decryption Key (Envelope vs Legacy) ──────────
+      let decryptionKey: Buffer;
+      const isEnvelopeEncryption = !!(encrypted_dek && dek_iv && dek_tag);
+
+      if (isEnvelopeEncryption) {
+        const unwrapped = this.unwrapDEK(encrypted_dek, dek_iv, dek_tag);
+        if (!unwrapped) {
+          console.error('❌ [Encryption] DEK unwrap failed — tampered or wrong key');
+          return null;
+        }
+        decryptionKey = unwrapped;
+      } else {
+        // Fallback for media uploaded before Envelope Encryption was released
+        decryptionKey = this.key; 
+      }
+
+      // ── Step 2: Read .enc file into memory ───────────────────────────────
+      const encBase64  = await fs.promises.readFile(encryptedPath, 'base64');
+      const ciphertext = Buffer.from(encBase64, 'base64');
+
+      // ── Step 3: Decrypt with resolved key ─────────────────────────────────
+      const isHex   = (s: string) => /^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0;
+      const iv      = Buffer.from(ivHex,  isHex(ivHex)  ? 'hex' : 'base64');
+      const authTag = Buffer.from(tagHex, isHex(tagHex) ? 'hex' : 'base64');
+
+      const decipher = QuickCrypto.createDecipheriv(ALGORITHM_FILE, decryptionKey, iv);  
+      decipher.setAuthTag(authTag);
+
+      const decPart1  = decipher.update(ciphertext);
+      const decPart2  = decipher.final();
+      const plaintext = Buffer.concat([decPart1, decPart2]);
+
+      // ── Step 4: Safely Zero-fill DEK from RAM ───────────────────────────
+      // CRITICAL: Only zero-fill if it's a temporary DEK. 
+      // If we used the Master Key, doing .fill(0) will wipe the user's active session!
+      if (isEnvelopeEncryption) {
+        decryptionKey.fill(0);                                                    
+      }
+
+      return plaintext.toString('base64');
+
+    } catch (error) {
+      console.error('❌ [Encryption] decryptFile failed:', error);
+      return null;
+    }
+  }
+
+
+  public async decryptFileToRollingCache(
+    encryptedPath: string,
+    ivBase64: string,
+    tagBase64: string,
+    mediaId: string,
+    encrypted_dek?: string, 
+    dek_iv?: string,       
+    dek_tag?: string,
+    extension: string = 'jpg'
+  ): Promise<string | null> {
+    
+    // 🟢 Ensure RAM is populated
+    if (!this.key && !this.extractedDeviceKey) {
+      await this.getOrGenerateDeviceKey();
+    }
+
+    // 🚀 FIX 1: Allow Guest Mode. Fetch the fallback key if the master key is missing.
+    const fallbackKey = this.getGuestFallbackKey();
+    if (!this.key && !fallbackKey) return null; // Only abort if BOTH are missing
+
+    try {
+      // ── Step 1: Clean the file path for NitroFS ──────────
+      const cleanPath = encryptedPath.replace(/^file:\/\//, '');
+
+      // ── Step 2: Resolve the Decryption Key (Envelope vs Legacy) ──────────
+      let decryptionKey: Buffer;
+      const isEnvelopeEncryption = !!(encrypted_dek && dek_iv && dek_tag);
+
+      if (isEnvelopeEncryption) {
+        // unwrapDEK already handles trying BOTH the Master Key and Guest Key!
+        const unwrapped = this.unwrapDEK(encrypted_dek!, dek_iv!, dek_tag!);  
+        if (!unwrapped) throw new Error("DEK Unwrap failed");
+        decryptionKey = unwrapped;
+      } else {
+        // 🚀 FIX 2: Legacy fallback must also use the Guest Key if Master is null
+        decryptionKey = (this.key || fallbackKey)!; 
+      }
+
+      // ── Step 3: Read File via Fast Nitro FS ─────────
+      const encBase64 = await fs.promises.readFile(cleanPath, 'base64');
+      let ciphertext = Buffer.from(encBase64, 'base64');
+
+      const isHex   = (s: string) => /^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0;
+      const iv      = Buffer.from(ivBase64,  isHex(ivBase64)  ? 'hex' : 'base64');
+      const authTag = Buffer.from(tagBase64, isHex(tagBase64) ? 'hex' : 'base64');
+
+      // ── Step 4: RESTORE FOOLPROOF LEGACY CHECKS ──────────
+      let startsWithIv = true;
+      if (ciphertext.length >= iv.length) {
+        for(let i = 0; i < iv.length; i++) {
+          if (ciphertext[i] !== iv[i]) { startsWithIv = false; break; }
+        }
+      } else { startsWithIv = false; }
+      
+      if (startsWithIv) {
+         ciphertext = ciphertext.subarray(iv.length);
+      }
+
+      let endsWithTag = true;
+      if (ciphertext.length >= authTag.length) {
+        const offset = ciphertext.length - authTag.length;
+        for(let i = 0; i < authTag.length; i++) {
+          if (ciphertext[offset + i] !== authTag[i]) { endsWithTag = false; break; }
+        }
+      } else { endsWithTag = false; }
+      
+      if (endsWithTag) {
+         ciphertext = ciphertext.subarray(0, ciphertext.length - authTag.length);
+      }
+
+      // ── Step 5: Decrypt Data ────────────────────────────────────────────
+      const decipher = QuickCrypto.createDecipheriv(ALGORITHM_FILE, decryptionKey, iv); 
+      decipher.setAuthTag(authTag);
+
+      const decPart1 = decipher.update(ciphertext); 
+      const decPart2 = decipher.final();
+      const plaintext = Buffer.concat([decPart1, decPart2]);
+
+      // ── Step 6: Safely Zero-fill DEK (AFTER decryption!) ────────────────
+      if (isEnvelopeEncryption) {
+        decryptionKey.fill(0);
+      }
+
+      // ── Step 7: Write to Cache with proper Extension ──────────────
+      const ephemeralPath = `${Paths.cache}/dec_${mediaId}.${extension}`;
+      await fs.promises.writeFile(ephemeralPath, plaintext.toString('base64'), 'base64');
+
+      return `file://${ephemeralPath}`;
+    } catch (error) {
+      console.error('❌ [Encryption] decryptFileToRollingCache failed:', error);
+      return null;
+    }
+  } 
 
 
   /**
@@ -1197,8 +1611,26 @@ public async resetDevice(): Promise<void> {
    * @param dek  Raw 16-byte DEK buffer
    * @returns    { encrypted_dek, dek_iv, dek_tag } all hex strings, or null on failure
    */
+  // public wrapDEK(dek: Buffer): { encrypted_dek: string; dek_iv: string; dek_tag: string } | null {
+  //   if (!this.isReady || !this.key) return null;
+  //   try {
+  //     const iv     = QuickCrypto.randomBytes(IV_LENGTH);           // fresh 12-byte IV
+  //     const cipher = QuickCrypto.createCipheriv(ALGORITHM, this.key, iv);
+  //     const enc1   = cipher.update(dek);
+  //     const enc2   = cipher.final();
+  //     const tag    = cipher.getAuthTag();
+  //     return {
+  //       encrypted_dek: Buffer.concat([enc1, enc2]).toString('hex'),
+  //       dek_iv:        iv.toString('hex'),
+  //       dek_tag:       tag.toString('hex'),
+  //     };
+  //   } catch {
+  //     return null;
+  //   }
+  // }
+
   public wrapDEK(dek: Buffer): { encrypted_dek: string; dek_iv: string; dek_tag: string } | null {
-    // Use the master key if present, otherwise the device-derived guest key.
+    // ⚡ FIX: Fallback to the Guest Key
     const wrappingKey = this.key || this.getGuestFallbackKey();
     if (!wrappingKey) return null;
     
@@ -1218,10 +1650,32 @@ public async resetDevice(): Promise<void> {
     }
   }
 
-  
+  /**
+   * Unwraps an encrypted DEK using the master key.
+   * Called before decrypting a media file.
+   *
+   * @returns  Raw DEK buffer, or null on failure/tamper
+   */
+  // public unwrapDEK(encrypted_dek: string, dek_iv: string, dek_tag: string): Buffer | null {
+  //   if (!this.isReady || !this.key) return null;
+  //   try {
+  //     const isHex    = (s: string) => /^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0;
+  //     const iv       = Buffer.from(dek_iv,       isHex(dek_iv)       ? 'hex' : 'base64');
+  //     const tag      = Buffer.from(dek_tag,      isHex(dek_tag)      ? 'hex' : 'base64');
+  //     const encBytes = Buffer.from(encrypted_dek, isHex(encrypted_dek) ? 'hex' : 'base64');
+
+  //     const decipher = QuickCrypto.createDecipheriv(ALGORITHM, this.key, iv);
+  //     decipher.setAuthTag(tag);
+  //     const dec1 = decipher.update(encBytes);
+  //     const dec2 = decipher.final();
+  //     return Buffer.concat([dec1, dec2]);
+  //   } catch {
+  //     return null;
+  //   }
+  // }
 
   public unwrapDEK(encrypted_dek: string, dek_iv: string, dek_tag: string): Buffer | null {
-    // Try the master key first, then the guest fallback key.
+    // ⚡ FIX: Prioritize Master Key, fallback to Guest Key seamlessly
     const keysToTry = [];
     if (this.key) keysToTry.push(this.key);
     const guestKey = this.getGuestFallbackKey();
@@ -1249,8 +1703,13 @@ public async resetDevice(): Promise<void> {
     return null;
   }
 
+  // public getRawKeyBase64(): string | null {
+  //   if (!this.isReady || !this.key) return null;
+  //   return this.key.toString('base64');
+  // }
+
   public getRawKeyBase64(): string | null {
-    // Returns the master key if present, otherwise the guest fallback key.
+    // ⚡ FIX: Return either the Master Key or the Guest Fallback Key
     const activeKey = this.key || this.getGuestFallbackKey();
     if (!activeKey) return null;
     return activeKey.toString('base64');
@@ -1289,6 +1748,38 @@ public async resetDevice(): Promise<void> {
     return this.isReady;
   }
 
+  /**
+   * Can the journal databases be opened right now WITHOUT a Face ID prompt? Standard mode: always
+   * (the keys are read silently). Maximum Security / Vault: only once the Face ID bundle has been
+   * unlocked (after a background wipe it hasn't – opening a database would prompt by itself).
+   */
+  public get canOpenJournalSilently(): boolean {
+    if (!this.isBiometricProtectionEnabled()) return true;
+    return this.biometricBundleLoaded || !!this.extractedMirrorKey;
+  }
+
+  /**
+   * Keys for the native mirror fill (modules/wispday-mirror-fill), only while unlocked and only
+   * from memory – never prompts Face ID, never reads the keychain. The native side uses them for
+   * one pass and keeps nothing. Missing anything → null, and the JS path is used instead.
+   */
+  public async getKeysForNativeMirror(): Promise<{
+    deviceKey: string; mirrorKey: string; masterKey: string | null; guestKey: string | null;
+  } | null> {
+    try {
+      const deviceKey = this.extractedDeviceKey ?? (this.deviceKeyPromise ? await this.deviceKeyPromise : null);
+      const mirrorKey = this.extractedMirrorKey;
+      if (!deviceKey || !mirrorKey) return null;
+      const guest = this.getGuestFallbackKey();
+      const masterKey = this.key ? Buffer.from(this.key).toString('base64') : null;
+      const guestKey = guest ? Buffer.from(guest).toString('base64') : null;
+      if (!masterKey && !guestKey) return null;
+      return { deviceKey, mirrorKey, masterKey, guestKey };
+    } catch {
+      return null;
+    }
+  }
+
   private cleanup(): void {
     if (this.key) {
       this.key.fill(0);
@@ -1303,4 +1794,4 @@ public async resetDevice(): Promise<void> {
 }
 
 export const encryptionService = new EncryptionService();
-export type { InitResult };
+export type { InitResult }; 
